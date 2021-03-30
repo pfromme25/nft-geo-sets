@@ -1,0 +1,137 @@
+#!/usr/bin/python3
+# Copyright (C) 2021 Philipp Fromme
+#
+# This file is part of nft-geo-sets, a tool to automatically create nftables sets
+# corresponding to ip ranges of specific countries.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+import argparse
+import configparser
+import json
+import logging
+import os
+import sys
+import urllib.request
+from datetime import datetime
+
+parser = argparse.ArgumentParser(description="Get IP ranges for specific countries.")
+parser.add_argument("-d", "--dry", help="Do not write to file", action="store_true")
+parser.add_argument("-l", "--level", help="Set the log level to use", nargs="?",
+                    default="WARNING")   
+parser.add_argument("-L", "--logdir", help="Set the loggin directory", nargs="?", 
+                    default="/var/log/nft-geo-sets/")
+parser.add_argument("-v", "--verbose", help="Verbose output.", action="store_true")
+args = parser.parse_args()
+
+logging.basicConfig(format='%(asctime)s %(name)s:%(message)s', datefmt='%b %d %H:%M:%S',
+                    filename=os.path.join(args.logdir, "nft-geo-sets.log"), level=args.level)
+logger = logging.getLogger()
+if args.verbose:
+    print_logger = logging.StreamHandler(sys.stdout)
+    logger.addHandler(print_logger)
+
+def get_ripe_json(country):
+    api_url = "https://stat.ripe.net/data/country-resource-list/data.json?resource={};v4_format=prefix".format(country)
+    request = urllib.request.urlopen(api_url)
+    json_dict = json.load(request)
+    data = json_dict["data"]
+    query_time = data["query_time"]
+    resources = data["resources"]
+    ipv4 = resources["ipv4"]
+    ipv6 = resources["ipv6"]
+    return query_time, ipv4, ipv6
+
+def create_set_string(query_time, family, table, set_name, set_type, ip_list):
+    marker = "# Created by nft-geo-sets on {}".format(datetime.now().isoformat(" "))
+    marker += "\n# query_time = {}".format(query_time)
+    set_string = "add set {} {} {} {{\n\ttype {};\n\tflags interval;".format(family, table, set_name, set_type)
+    set_string += "\n\telements = {{{}}};\n}}".format(("".join("\n\t\t{},".format(ip) for ip in ip_list))[:-1])
+    file_string = "{}\n\n{}\n".format(marker, set_string)
+    return file_string
+
+def check_write(filepath, query_time, set_string):
+    is_Outdated = False
+    if os.path.exists(filepath):
+        is_Outdated = compare_query_time(query_time, filepath)
+        if is_Outdated == None:
+            logger.warning("File %s is configured to be written by nft-geo-sets but does not contain marker, therfor ignoring it.", filepath)
+        elif is_Outdated == False:
+            logger.info("File %s query_time %s matches, therefor not writing it again.", filepath, query_time)
+    else:
+        is_Outdated = True
+    if not args.dry and is_Outdated:
+        write_to_file(set_string, filepath)
+
+def write_to_file(string, filename):
+    with open(filename, "w") as f:
+        f.write(string)
+
+def compare_query_time(query_time, filename):
+    with open(filename, "r") as f:
+        filestring = f.readlines()
+        if not filestring[0].startswith("# Created by nft-geo-sets on"):
+            return None
+        cached_query_list = filestring[1].split("=")
+        if len(cached_query_list) > 1:
+            cached_time = cached_query_list[1].split()[0]
+            logger.debug("Comparing cached time %s against query_time %s", cached_time, query_time)
+            if query_time == cached_time:
+                return False
+    return True
+
+def main():
+    config = configparser.ConfigParser()
+    config.read("/etc/nft-geo-sets.conf")
+    default = config['DEFAULT']
+    directory = default.get('directory')
+    default_family_v4 = default.get('family_v4')
+    default_family_v6 = default.get('family_v6')
+    default_priority = default.get('priority')
+    default_table = default.get('table')
+    logger.debug("Default directory %s", directory)
+    logger.debug("Default family_v4 %s", default_family_v4)
+    logger.debug("Default family_v6 %s", default_family_v6)
+    logger.debug("Default priority %s", default_priority)
+    logger.debug("Default table %s", default_table)
+    country_definitions = config.sections()
+    for country in country_definitions:
+        logger.debug("--- %s ---", country)
+        country_config = config[country]
+        is_ipv4 = country_config.getboolean("ipv4")
+        is_ipv6 = country_config.getboolean("ipv6")
+        family_v4 = country_config.get('family_v4', default_family_v4)
+        family_v6 = country_config.get('family_v6', default_family_v6)
+        priority = country_config.get("priority", default_priority)
+        table = country_config.get("table", default_table)
+        logger.debug("family_v4 %s", family_v4)
+        logger.debug("family_v6 %s", family_v6)
+        logger.debug("priority %s", priority)
+        logger.debug("table %s", table)
+        query_time, ipv4_list, ipv6_list = get_ripe_json(country)
+        filename_prefix = "{}-{}".format(priority, country)
+        if is_ipv4:
+            v4_set_name = "{}-v4".format(country)
+            ipv4_set_string = create_set_string(query_time, family_v4, table, v4_set_name, "ipv4_addr", ipv4_list)
+            logger.debug("IPv4 Set String %s", ipv4_set_string)
+            ipv4_filepath = os.path.join(directory, "{}-v4.nft".format(filename_prefix))
+            check_write(ipv4_filepath, query_time, ipv4_set_string)
+        if is_ipv6:
+            v6_set_name = "{}-v6".format(country)
+            ipv6_set_string = create_set_string(query_time, family_v6, table, v6_set_name, "ipv6_addr", ipv6_list)
+            logger.debug("IPv6 Set String %s", ipv6_set_string)
+            ipv6_filepath = os.path.join(directory, "{}-v6.nft".format(filename_prefix))
+            check_write(ipv6_filepath, query_time, ipv6_set_string)
+
+main()
