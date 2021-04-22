@@ -43,7 +43,7 @@ if args.verbose:
     logger.addHandler(print_logger)
 
 def get_ripe_json(country):
-    api_url = "https://stat.ripe.net/data/country-resource-list/data.json?resource={};v4_format=prefix".format(country)
+    api_url = "https://stat.ripe.net/data/country-resource-list/data.json?resource={}&v4_format=prefix".format(country)
     request = urllib.request.urlopen(api_url)
     json_dict = json.load(request)
     data = json_dict["data"]
